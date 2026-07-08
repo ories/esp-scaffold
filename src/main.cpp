@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <ElegantOTA.h>
 #include <ESPAsyncWebServer.h>
 #include <WiFi.h>
 
@@ -29,7 +28,7 @@ void setup() {
 }
 
 void loop() {
-  ElegantOTA.loop();  // handles the post-upload reboot, required even in async mode
+  webUILoop();  // reboots after a completed OTA upload
 
   static unsigned long lastHeartbeat = 0;
   unsigned long now = millis();

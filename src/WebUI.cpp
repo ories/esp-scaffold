@@ -1,6 +1,6 @@
 #include "WebUI.h"
 
-#include <ElegantOTA.h>
+#include <Update.h>
 
 #include "Logger.h"
 #include "Theme.h"
@@ -110,6 +110,43 @@ const char LOGS_BODY[] PROGMEM = R"HTML(<div class="box">
 </script>
 )HTML";
 
+const char OTA_BODY[] PROGMEM = R"HTML(<div class="box">
+<div class="box-title">Firmware Update</div>
+<form id="otaForm">
+  <input type="file" id="firmware" name="firmware" accept=".bin">
+  <button type="submit">Upload</button>
+</form>
+<progress id="progressBar" value="0" max="100" style="display:none;width:100%;margin-top:12px"></progress>
+<div id="status" style="margin-top:8px;font-size:14px"></div>
+</div>
+<script>
+  const form = document.getElementById('otaForm');
+  const bar = document.getElementById('progressBar');
+  const status = document.getElementById('status');
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const file = document.getElementById('firmware').files[0];
+    if (!file) return;
+    const data = new FormData();
+    data.append('firmware', file);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/update');
+    xhr.upload.addEventListener('progress', (evt) => {
+      if (!evt.lengthComputable) return;
+      bar.style.display = 'block';
+      bar.value = (evt.loaded / evt.total) * 100;
+    });
+    xhr.onload = () => {
+      status.textContent = xhr.status === 200
+        ? xhr.responseText + ' Rebooting...'
+        : 'Update failed: ' + xhr.responseText;
+    };
+    xhr.onerror = () => { status.textContent = 'Upload failed'; };
+    xhr.send(data);
+  });
+</script>
+)HTML";
+
 String renderLogsPage() {
   String page = String((const __FlashStringHelper *)PAGE_SHELL);
   page.replace("%THEME%", String((const __FlashStringHelper *)THEME_CSS));
@@ -122,7 +159,63 @@ String renderLogsPage() {
   return page;
 }
 
+String renderOTAPage() {
+  String page = String((const __FlashStringHelper *)PAGE_SHELL);
+  page.replace("%THEME%", String((const __FlashStringHelper *)THEME_CSS));
+  page.replace("%TITLE%", "Firmware Update");
+  page.replace("%BODY%", String((const __FlashStringHelper *)OTA_BODY));
+  page.replace("%NAV_LOGS%", "");
+  page.replace("%NAV_OTA%", "active");
+  page.replace("%COMMIT%", GIT_COMMIT);
+  page.replace("%BUILD_TIME%", BUILD_TIMESTAMP);
+  return page;
+}
+
+volatile bool otaRebootPending = false;
+unsigned long otaRebootAt = 0;
+
+void handleOTAUpload(AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data,
+                      size_t len, bool final) {
+  if (index == 0) {
+    logger.log("OTA update started: " + filename);
+    size_t size = request->contentLength() ? request->contentLength() : UPDATE_SIZE_UNKNOWN;
+    if (!Update.begin(size, U_FLASH)) {
+      Update.printError(Serial);
+      logger.log("OTA update failed to start: " + String(Update.errorString()));
+    }
+  }
+
+  if (Update.isRunning() && Update.write(data, len) != len) {
+    Update.printError(Serial);
+  }
+
+  if (final) {
+    if (Update.isRunning() && Update.end(true)) {
+      logger.log("OTA update finished successfully, size=" + String(index + len));
+    } else {
+      Update.printError(Serial);
+      logger.log("OTA update failed: " + String(Update.errorString()));
+    }
+  }
+}
+
+void handleOTAComplete(AsyncWebServerRequest *request) {
+  bool success = !Update.hasError();
+  request->send(success ? 200 : 500, "text/plain",
+                success ? "Update successful." : Update.errorString());
+  if (success) {
+    otaRebootAt = millis() + 500;  // give the response time to flush before rebooting
+    otaRebootPending = true;
+  }
+}
+
 }  // namespace
+
+void webUILoop() {
+  if (otaRebootPending && millis() >= otaRebootAt) {
+    ESP.restart();
+  }
+}
 
 void setupWebUI(AsyncWebServer &server) {
   logger.begin(server);
@@ -137,9 +230,13 @@ void setupWebUI(AsyncWebServer &server) {
     WiFiSetup::forget();
   });
 
-  ElegantOTA.begin(&server);  // mounts GET/POST /update
-  ElegantOTA.onStart([]() { logger.log("OTA update started"); });
-  ElegantOTA.onEnd([](bool success) {
-    logger.log(success ? "OTA update finished successfully" : "OTA update failed");
+  server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", renderOTAPage());
   });
+
+  server.on(
+      "/update", HTTP_POST, handleOTAComplete, [](AsyncWebServerRequest *request, const String &filename,
+                                                    size_t index, uint8_t *data, size_t len, bool final) {
+        handleOTAUpload(request, filename, index, data, len, final);
+      });
 }
